@@ -10,6 +10,7 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const isTouch = matchMedia('(hover: none)').matches;
 const money = n => '$' + n.toLocaleString('en-US');
+const money2 = n => '$' + n.toLocaleString('en-US', { minimumFractionDigits: Number.isInteger(n) ? 0 : 2, maximumFractionDigits: 2 });
 
 /* =========================================================
    Catalogue
@@ -231,7 +232,7 @@ void main(){
 }`;
 const clothFrag = /* glsl */`
 uniform sampler2D uMapA, uMapB, uMaskA, uMaskB;
-uniform float uMix, uTime, uOpacity;
+uniform float uMix, uTime, uOpacity, uWeave;
 uniform vec3 uSheen;
 varying vec2 vUv; varying vec3 vN; varying vec3 vWPos; varying vec3 vT;
 float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -239,8 +240,21 @@ void main(){
   // fringe threads at both ends
   float endD = min(vUv.y, 1. - vUv.y);
   if (endD < .018 && fract(vUv.x * 70.) > .45) discard;
-  vec3 base = mix(texture2D(uMapA, vUv).rgb, texture2D(uMapB, vUv).rgb, uMix);
-  float metal = mix(texture2D(uMaskA, vUv).r, texture2D(uMaskB, vUv).r, uMix);
+  // --- the cloth is woven: warp threads run down first, then the weft fills row by row ---
+  float warpX = fract(vUv.x * 96.), warpI = floor(vUv.x * 96.);
+  float rowI = floor(vUv.y * 420.);
+  float warpLen = clamp((uWeave - hash(vec2(warpI, 3.)) * .3) / .4, 0., 1.);
+  bool warpOn = warpX < .46 && (1. - vUv.y) < warpLen;
+  float front = (uWeave - .32) / .62;
+  float rowJit = (hash(vec2(rowI, 9.)) - .5) * .05 + (hash(vec2(floor(vUv.x * 12.), rowI)) - .5) * .02;
+  bool weftOn = (1. - vUv.y) < front + rowJit;
+  if (!weftOn && !warpOn) discard;
+  // --- a new print is embroidered in, stitch by stitch, rather than cross-faded ---
+  float sn = hash(vec2(floor(vUv.x * 40.), floor(vUv.y * 160.)));
+  float sweep = (1. - vUv.y) * .3 + sn * .7;
+  float mx = smoothstep(sweep - .05, sweep + .05, uMix * 1.1 - .05);
+  vec3 base = mix(texture2D(uMapA, vUv).rgb, texture2D(uMapB, vUv).rgb, mx);
+  float metal = mix(texture2D(uMaskA, vUv).r, texture2D(uMaskB, vUv).r, mx);
   vec3 N = normalize(vN); if (!gl_FrontFacing) N = -N;
   vec3 V = normalize(cameraPosition - vWPos);
   vec3 L1 = normalize(vec3(-.5, .75, .65)), L2 = normalize(vec3(.8, -.2, -.4));
@@ -262,6 +276,11 @@ void main(){
   col += g * metal * vec3(1.6, 1.35, 1.);
   if (!gl_FrontFacing) col *= .78;
   if (endD < .018) col = mix(col, base * .9, .4);
+  if (!weftOn) col = base * (.7 + wrap * .5) + aniso * .3;                // bare warp threads
+  float edgeGlow = smoothstep(.035, 0., abs((1. - vUv.y) - front - rowJit)) * step(uWeave, .995);
+  col += vec3(1., .82, .5) * edgeGlow * .9;                                 // the shuttle line
+  float seam = smoothstep(.06, 0., abs(mx - .5)) * step(.01, uMix) * step(uMix, .99);
+  col += vec3(1., .86, .6) * seam * .35;
   gl_FragColor = vec4(col, uOpacity);
   #include <colorspace_fragment>
 }`;
@@ -288,6 +307,50 @@ void main(){
   gl_FragColor = vec4(c * (.45 + vGlint * 2.2), ring * uOpacity * (.35 + vGlint));
 }`;
 
+const threadVert = /* glsl */`
+attribute float aT; attribute float aDelay; attribute vec3 aCol;
+varying float vT; varying float vD; varying vec3 vCol;
+void main(){ vT = aT; vD = aDelay; vCol = aCol; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }`;
+const threadFrag = /* glsl */`
+uniform float uProg; varying float vT; varying float vD; varying vec3 vCol;
+void main(){
+  float p = clamp(uProg * 1.7 - vD, 0., 1.35);
+  float a = smoothstep(p - .42, p, vT) * step(vT, p);
+  if (a < .01) discard;
+  gl_FragColor = vec4(vCol * (1. + smoothstep(p - .05, p, vT) * 1.5), a);
+}`;
+let threads, threadMat;
+function buildThreads(n) {
+  const SEG = 48, pos = [], aT = [], aD = [], aC = [];
+  const cols = [[.95, .7, .3], [.9, .2, .45], [1, .95, .9], [.95, .78, .4]];
+  for (let i = 0; i < n; i++) {
+    const end = new THREE.Vector3((Math.random() - .5) * 1.4, (Math.random() - .5) * 5.6, 0);
+    const a = Math.random() * Math.PI * 2, r = 4 + Math.random() * 4;
+    const start = new THREE.Vector3(Math.cos(a) * r, Math.sin(a) * r * 1.2, (Math.random() - .3) * 5);
+    const c1 = start.clone().lerp(end, .33).add(new THREE.Vector3((Math.random() - .5) * 3, (Math.random() - .5) * 3, Math.random() * 2));
+    const c2 = start.clone().lerp(end, .7).add(new THREE.Vector3((Math.random() - .5) * 2, (Math.random() - .5) * 2, 1.5));
+    const curve = new THREE.CubicBezierCurve3(start, c1, c2, end);
+    const pts = curve.getPoints(SEG), col = cols[i % cols.length], d = Math.random() * .6;
+    for (let k = 0; k < SEG; k++) {
+      pos.push(...pts[k].toArray(), ...pts[k + 1].toArray());
+      aT.push(k / SEG, (k + 1) / SEG); aD.push(d, d); aC.push(...col, ...col);
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('aT', new THREE.Float32BufferAttribute(aT, 1));
+  g.setAttribute('aDelay', new THREE.Float32BufferAttribute(aD, 1));
+  g.setAttribute('aCol', new THREE.Float32BufferAttribute(aC, 3));
+  threadMat = new THREE.ShaderMaterial({ vertexShader: threadVert, fragmentShader: threadFrag, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, uniforms: { uProg: { value: 0 } } });
+  const l = new THREE.LineSegments(g, threadMat); l.frustumCulled = false; return l;
+}
+const threadAnim = { v: 1.4 };
+function playThreads(dur = 1.9) {
+  if (!threads || reduceMotion) return;
+  gsap.killTweensOf(threadAnim); threadAnim.v = 0;
+  gsap.to(threadAnim, { v: 1.4, duration: dur, ease: 'power1.inOut' });
+}
+
 function initStage() {
   try {
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: 'high-performance' });
@@ -309,7 +372,7 @@ function initStage() {
     vertexShader: clothVert, fragmentShader: clothFrag, transparent: true, side: THREE.DoubleSide, depthWrite: false,
     uniforms: {
       uTime: { value: 0 }, uAmp: { value: reduceMotion ? .35 : 1 }, uStr: { value: 0 }, uHit: { value: new THREE.Vector2(.5, .5) },
-      uW: { value: W }, uL: { value: L }, uMix: { value: 0 }, uOpacity: { value: 0 },
+      uW: { value: W }, uL: { value: L }, uMix: { value: 0 }, uOpacity: { value: 0 }, uWeave: { value: 0 },
       uMapA: { value: textures[4].map }, uMapB: { value: textures[4].map }, uMaskA: { value: textures[4].mask }, uMaskB: { value: textures[4].mask },
       uSheen: { value: new THREE.Color('#ffd9e8') }
     }
@@ -318,6 +381,8 @@ function initStage() {
   cloth = new THREE.Mesh(geo, clothMat);
   group = new THREE.Group();
   group.add(cloth);
+  threads = buildThreads(small ? 22 : 40);
+  group.add(threads);
 
   const N = small ? 90 : 170;
   const sg = new THREE.PlaneGeometry(.075, .075);
@@ -339,30 +404,30 @@ function initStage() {
 /* poses the cloth moves between as you scroll */
 const POSES = {
   desktop: {
-    hero:        { p: [2.25, .1, 0],   r: [-.35, .45, -.62], s: 1.05, o: 1,   so: 1 },
-    collections: { p: [.6, .35, -3.2], r: [.25, .1, -1.38],  s: 1.3,  o: .9,  so: .6 },
-    craft:       { p: [2.35, .15, 0],  r: [-.2, -.38, -.32], s: .95,  o: 1,   so: .5 },
-    signup:      { p: [0, .1, -2.2],   r: [.12, 0, -1.5],    s: 1.35, o: .95, so: .9 },
-    hide:        { p: [0, -3.2, -2],   r: [0, 0, -1.1],      s: 1,    o: 0,   so: 0 }
+    hero:        { p: [2.25, .1, 0],   r: [-.35, .45, -.62], s: 1.05, o: 1,   so: 1,  w: 1 },
+    collections: { p: [.6, .35, -3.2], r: [.25, .1, -1.38],  s: 1.3,  o: .9,  so: .6, w: 1 },
+    craft:       { p: [2.35, .15, 0],  r: [-.2, -.38, -.32], s: .95,  o: 1,   so: .5, w: 1 },
+    signup:      { p: [0, .1, -2.2],   r: [.12, 0, -1.5],    s: 1.35, o: .95, so: .9, w: 1 },
+    hide:        { p: [.4, -.6, -1.4], r: [-.1, .2, -.9],    s: 1,    o: 1,   so: 0,  w: 0 }
   },
   mobile: {
-    hero:        { p: [.3, 1.75, 0],   r: [-.3, .3, -1.1],   s: .5,   o: 1,   so: .8 },
-    collections: { p: [0, 2.55, -2],   r: [.2, .1, -1.5],    s: .62,  o: .6,  so: .5 },
-    craft:       { p: [-.2, 1.2, 0],   r: [-.2, -.3, -1.2],  s: .5,   o: 1,   so: .4 },
-    signup:      { p: [0, 2.35, -1.5], r: [.1, 0, -1.5],     s: .66,  o: .9,  so: .8 },
-    hide:        { p: [0, -3, -2],     r: [0, 0, -1.1],      s: .7,   o: 0,   so: 0 }
+    hero:        { p: [.3, 1.75, 0],   r: [-.3, .3, -1.1],   s: .5,   o: 1,   so: .8, w: 1 },
+    collections: { p: [0, 2.9, -2],    r: [.2, .1, -1.5],    s: .6,   o: .55,  so: .5, w: 1 },
+    craft:       { p: [-.2, 1.2, 0],   r: [-.2, -.3, -1.2],  s: .5,   o: 1,   so: .4, w: 1 },
+    signup:      { p: [0, 2.35, -1.5], r: [.1, 0, -1.5],     s: .66,  o: .9,  so: .8, w: 1 },
+    hide:        { p: [0, .2, -1.2],   r: [-.1, .2, -1.2],   s: .6,   o: 1,   so: 0,  w: 0 }
   }
 };
 const SCENE_TEX = { hero: 4, signup: 1 };
 let craftTex = 0, collK = 0, collActive = false;
-const cur = { p: new THREE.Vector3(0, -3, -2), r: new THREE.Vector3(0, 0, -1.1), s: 1, o: 0, so: 0 };
+const cur = { p: new THREE.Vector3(2.25, .1, 0), r: new THREE.Vector3(-.35, .45, -.62), s: 1, o: 1, so: 0, w: 0 };
 const sceneEls = () => $$('[data-scene]');
 
 function scrollTargets() {
   const vh = innerHeight, mid = vh / 2;
   const set = innerWidth / innerHeight < .9 ? POSES.mobile : POSES.desktop;
   const widthK = innerWidth / innerHeight < .9 ? 1 : Math.min(1, (innerWidth / innerHeight) / 1.6);
-  const acc = { p: [0, 0, 0], r: [0, 0, 0], s: 0, o: 0, so: 0 }; let wsum = 0, best = null, bestW = 0;
+  const acc = { p: [0, 0, 0], r: [0, 0, 0], s: 0, o: 0, so: 0, w: 0 }; let wsum = 0, best = null, bestW = 0;
   for (const el of sceneEls()) {
     const rc = el.getBoundingClientRect();
     if (rc.bottom < -vh || rc.top > vh * 2) continue;
@@ -371,13 +436,14 @@ function scrollTargets() {
     if (!w) continue;
     const key = el.dataset.scene, pose = set[key];
     acc.p.forEach((_, i) => { acc.p[i] += pose.p[i] * w; acc.r[i] += pose.r[i] * w; });
-    acc.s += pose.s * w; acc.o += pose.o * w; acc.so += pose.so * w; wsum += w;
+    acc.s += pose.s * w; acc.o += pose.o * w; acc.so += pose.so * w; acc.w += pose.w * w; wsum += w;
     if (w > bestW) { bestW = w; best = key; }
   }
   if (!wsum) return { pose: set.hide, tex: null, scene: 'hide' };
   const k = 1 / wsum;
-  const pose = { p: acc.p.map(v => v * k), r: acc.r.map(v => v * k), s: acc.s * k, o: acc.o * k, so: acc.so * k };
+  const pose = { p: acc.p.map(v => v * k), r: acc.r.map(v => v * k), s: acc.s * k, o: acc.o * k, so: acc.so * k, w: acc.w * k };
   pose.p[0] *= widthK;
+  pose.w = set[best].w;   // the section in front decides: woven or unravelled (the frame loop animates between)
   return { pose, scene: best };
 }
 
@@ -427,12 +493,15 @@ const clock = new THREE.Clock();
 let running = true;
 function frame() {
   if (!running) return;
-  const dt = Math.min(clock.getDelta(), .05), t = clock.elapsedTime;
+  const rawDt = clock.getDelta(), dt = Math.min(rawDt, .1), t = clock.elapsedTime;
   const { pose, scene: sk } = scrollTargets();
   const ease = 1 - Math.pow(.0025, dt);   // frame-rate independent smoothing
   cur.p.lerp(new THREE.Vector3(...pose.p), ease);
   cur.r.lerp(new THREE.Vector3(...pose.r), ease);
   cur.s += (pose.s - cur.s) * ease; cur.o += (pose.o - cur.o) * ease; cur.so += (pose.so - cur.so) * ease;
+  const prevW = cur.w;
+  cur.w += (pose.w - cur.w) * (1 - Math.pow(.12, dt));        // weave and unravel a little slower than the move
+  if (prevW < .25 && cur.w >= .25 && introDone) playThreads(1.4);
 
   const tiltX = pointer.ndc.x > -2 ? pointer.ndc.y * .08 : 0, tiltY = pointer.ndc.x > -2 ? pointer.ndc.x * .12 : 0;
   group.position.copy(cur.p);
@@ -444,7 +513,7 @@ function frame() {
     pointer.moved = false;
     raycaster.setFromCamera(pointer.ndc, camera);
     const hit = raycaster.intersectObject(cloth, false)[0];
-    if (hit && hit.uv) { hitUv.lerp(hit.uv, hitStr < .05 ? 1 : .35); hitStr = Math.min(1, hitStr + pointer.speed * .9); }
+    if (hit && hit.uv) { hitUv.lerp(hit.uv, hitStr < .05 ? 1 : .35); hitStr = Math.min(1, hitStr + pointer.speed * .9); if (cur.w > .9) { silkRub += pointer.speed; if (silkRub > 30) eggs.find('silk'); } }
   }
   pointer.speed *= .9;
   hitStr *= Math.pow(.25, dt);
@@ -453,15 +522,18 @@ function frame() {
   u.uTime.value = reduceMotion ? t * .25 : t;
   u.uStr.value = hitStr * (reduceMotion ? .3 : 1);
   u.uHit.value.copy(hitUv);
-  u.uOpacity.value = cur.o * introFade.v;
+  u.uOpacity.value = cur.o;
+  u.uWeave.value = reduceMotion ? (cur.w > .5 ? 1 : 0) : Math.min(cur.w, introFade.v);
+  if (threadMat) threadMat.uniforms.uProg.value = threadAnim.v;
   seqMat.uniforms.uTime.value = t; seqMat.uniforms.uOpacity.value = cur.so * introFade.v * (reduceMotion ? .4 : 1);
-  updateTexture(sk, dt);
+  updateTexture(sk, Math.min(rawDt, .25));
 
-  canvas.style.visibility = cur.o * introFade.v < .01 && cur.so < .01 ? 'hidden' : 'visible';
+  canvas.style.visibility = (u.uWeave.value < .005 && threadAnim.v >= 1.4 && cur.so * introFade.v < .01) ? 'hidden' : 'visible';
   if (canvas.style.visibility === 'visible') renderer.render(scene, camera);
   requestAnimationFrame(frame);
 }
 const introFade = { v: 0 };
+let introDone = false, silkRub = 0;
 
 function onResize() {
   if (!webglOK) return;
@@ -498,12 +570,25 @@ function initScroll() {
   });
 
 
-  // header
+  // header: hide on the way down, liquid-glass lens follows the section you're in
   const header = $('#header'); let lastY = 0;
+  const lens = $('#navLens'), navLinks = $$('#nav a');
+  const moveLens = id => {
+    const a = navLinks.find(l => l.dataset.sec === id);
+    if (!a) { lens.style.opacity = 0; return; }
+    lens.style.opacity = 1; lens.style.width = a.offsetWidth + 'px'; lens.style.transform = `translateX(${a.offsetLeft}px)`;
+  };
+  navLinks.forEach(a => { const sec = $('#' + a.dataset.sec); if (sec) ScrollTrigger.create({ trigger: sec, start: 'top 50%', end: 'bottom 50%', onToggle: s => { if (s.isActive) moveLens(a.dataset.sec); } }); });
+  ScrollTrigger.create({ trigger: '#hero', start: 'top top', end: 'bottom 50%', onToggle: s => { if (s.isActive) moveLens(null); } });
+  ScrollTrigger.create({ trigger: '#signup', start: 'top 50%', end: 'bottom bottom', onToggle: s => { if (s.isActive) moveLens(null); } });
+  const hg = $('#headerGlass');
+  hg.addEventListener('pointermove', e => { const r = hg.getBoundingClientRect(); hg.style.setProperty('--gx', (e.clientX - r.left) + 'px'); hg.style.setProperty('--gy', (e.clientY - r.top) + 'px'); });
+  hg.addEventListener('pointerleave', () => { hg.style.removeProperty('--gx'); hg.style.removeProperty('--gy'); });
   ScrollTrigger.create({ start: 0, end: 'max', onUpdate: self => {
     const y = self.scroll();
     header.classList.toggle('is-scrolled', y > 40);
-    header.classList.toggle('is-hidden', y > 400 && y > lastY && !$('#mobileMenu').classList.contains('is-open'));
+    header.classList.toggle('is-hidden', y > 400 && y > lastY + 2 && !$('#mobileMenu').classList.contains('is-open'));
+    if (y < lastY - 2 || y < 400) header.classList.remove('is-hidden');
     lastY = y;
   } });
 
@@ -576,6 +661,7 @@ function initMarquee() {
 /* =========================================================
    Craft tabs
    ========================================================= */
+const stitchesSeen = new Set(['0']);
 function initCraft() {
   const tabs = $$('.tech-btn'), imgs = $$('.craft-photo img');
   const select = btn => {
@@ -583,6 +669,8 @@ function initCraft() {
     craftTex = +btn.dataset.tech;
     imgs.forEach(i => i.classList.toggle('is-on', i.dataset.key === btn.dataset.img));
     hitStr = Math.min(1, hitStr + .8); hitUv.set(.5, .5);  // a little shiver when the print changes
+    playThreads(1.3);
+    stitchesSeen.add(btn.dataset.tech); if (stitchesSeen.size >= 4) eggs.find('stitches');
   };
   tabs.forEach((b, i) => {
     b.addEventListener('click', () => select(b));
@@ -611,7 +699,13 @@ function renderBag() {
   const list = $('#bagList');
   const count = bag.reduce((s, l) => s + l.qty, 0);
   $('#bagCount').textContent = count;
-  $('#bagTotal').textContent = money(bag.reduce((s, l) => s + allItems[l.id].price * l.qty, 0));
+  const sub = bag.reduce((s, l) => s + allItems[l.id].price * l.qty, 0);
+  const d = bestDiscount(), off = Math.round(sub * d.percent) / 100;
+  $('#bagSub').textContent = money(sub);
+  $('#discRow').hidden = !d.percent;
+  $('#discLabel').textContent = d.percent ? `${d.label} (${d.percent}%, ${d.code})` : 'Discount';
+  $('#discAmt').textContent = '−' + money2(off);
+  $('#bagTotal').textContent = money2(sub - off);
   if (!bag.length) { list.innerHTML = '<li class="bag-empty">Your bag is empty. Everything in it stays here while you browse.</li>'; return; }
   list.innerHTML = bag.map((l, i) => { const p = allItems[l.id]; return `
     <li class="bag-line"><img src="img/${p.img}.webp" alt="" style="object-position:${p.pos || '50% 30%'}" width="76" height="95">
@@ -624,6 +718,16 @@ function initBag() {
   const open = () => { drawer.classList.add('is-open'); drawer.setAttribute('aria-hidden', 'false'); scrim.classList.add('is-on'); lenis?.stop(); setTimeout(() => $('#drawerClose').focus(), 300); };
   const close = () => { drawer.classList.remove('is-open'); drawer.setAttribute('aria-hidden', 'true'); scrim.classList.remove('is-on'); lenis?.start(); $('#checkoutMsg').textContent = ''; };
   window.__openBag = open;
+  $('#codeForm').addEventListener('submit', e => {
+    e.preventDefault();
+    const code = $('#codeInput').value.trim().toUpperCase(), msg = $('#codeMsg');
+    if (!code) { msg.textContent = 'Type a code, then press Apply.'; return; }
+    if (code === 'RESHAM15') {
+      if (eggs.count() === 5) { discounts.eggs = 15; saveDiscounts(); renderBag(); msg.textContent = 'RESHAM15 applied: 15% off.'; }
+      else msg.textContent = `RESHAM15 unlocks once you find all five hidden threads. You have ${eggs.count()} of 5.`;
+    } else if (discounts.voice && code === 'NOOR' + discounts.voice) { msg.textContent = `${code} is already on your bag.`; }
+    else msg.textContent = `${code} isn't a code we recognise. Check the spelling and try again.`;
+  });
   $('#bagBtn').addEventListener('click', open);
   $('#drawerClose').addEventListener('click', close);
   scrim.addEventListener('click', close);
@@ -637,7 +741,8 @@ function initBag() {
     saveBag(); renderBag();
   });
   $('#checkout').addEventListener('click', () => {
-    $('#checkoutMsg').textContent = bag.length ? 'Checkout is not connected in this preview, so no order was placed.' : 'Add a piece to your bag first.';
+    const d = bestDiscount();
+    $('#checkoutMsg').textContent = bag.length ? `Checkout is not connected in this preview, so no order was placed.${d.percent ? ` Your ${d.percent}% (${d.code}) would apply.` : ''}` : 'Add a piece to your bag first.';
   });
 }
 let toastTimer;
@@ -781,7 +886,7 @@ function initMenu() {
 function intro() {
   const loader = $('#loader');
   const lines = $$('.hero h1 .line > span');
-  if (reduceMotion) { loader.remove(); introFade.v = 1; return; }
+  if (reduceMotion) { loader.remove(); introFade.v = 1; introDone = true; return; }
   gsap.set(lines, { yPercent: 110 });
   gsap.set('.hero-sub, .hero-ctas, .hero-foot', { opacity: 0 });
   const path = $('#loaderStitch'), needle = $('#loaderNeedle'), len = path.getTotalLength();
@@ -797,9 +902,226 @@ function intro() {
     .to('#loaderWord', { opacity: 1, duration: .5 }, '-=.55')
     .to(loader, { clipPath: 'inset(0 0 100% 0)', duration: .9, ease: 'power3.inOut' }, '+=.25')
     .add(() => loader.remove())
-    .to(introFade, { v: 1, duration: 1.4, ease: 'power2.out' }, '-=.6')
-    .to(lines, { yPercent: 0, duration: 1.1, ease: 'power4.out', stagger: .1 }, '-=1.3')
+    .add(() => playThreads(2.1), '-=.75')
+    .to(introFade, { v: 1, duration: 2.6, ease: 'power1.inOut', onComplete: () => { introDone = true; } }, '-=.2')
+    .to(lines, { yPercent: 0, duration: 1.1, ease: 'power4.out', stagger: .1 }, '-=2.4')
     .to('.hero-sub, .hero-ctas, .hero-foot', { opacity: 1, duration: .8, stagger: .08 }, '-=.6');
+}
+
+/* =========================================================
+   Discounts: one per order, the bigger one wins
+   ========================================================= */
+let discounts = { voice: 0, voiceReason: '', eggs: 0 };
+try { discounts = { ...discounts, ...JSON.parse(localStorage.getItem('resham-discounts') || '{}') }; } catch (e) {}
+const saveDiscounts = () => { try { localStorage.setItem('resham-discounts', JSON.stringify(discounts)); } catch (e) {} };
+function bestDiscount() {
+  if (discounts.eggs >= discounts.voice && discounts.eggs) return { percent: discounts.eggs, code: 'RESHAM15', label: 'Hidden threads' };
+  if (discounts.voice) return { percent: discounts.voice, code: 'NOOR' + discounts.voice, label: 'From Noor' };
+  return { percent: 0, code: '', label: '' };
+}
+
+/* =========================================================
+   Hidden threads: five easter eggs, 15% for finding them all
+   ========================================================= */
+const EGGS = [
+  { id: 'needle',   name: 'The golden needle', hint: 'The needle by our name likes a few quick taps.' },
+  { id: 'silk',     name: 'Silk whisper',      hint: 'The silk loves to be stroked. Keep going for a while.' },
+  { id: 'stitches', name: 'Every stitch',      hint: 'In the craft section, try each of the four stitches.' },
+  { id: 'mirror',   name: 'The lost mirror',   hint: 'A tiny mirror glints somewhere in the shop-the-look photo.' },
+  { id: 'signature',name: 'Our signature',     hint: 'The giant word at the very bottom answers to five taps.' }
+];
+const ICON_ON = '<svg viewBox="0 0 26 26" aria-hidden="true"><circle cx="13" cy="13" r="11" fill="#F3B23A"/><path d="M8 13.5l3.2 3.2L18 9.8" fill="none" stroke="#2A0F24" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const ICON_OFF = '<svg viewBox="0 0 26 26" aria-hidden="true"><circle cx="13" cy="13" r="10" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="1.5" stroke-dasharray="3 3"/></svg>';
+const eggs = (() => {
+  let found = [];
+  try { found = JSON.parse(localStorage.getItem('resham-eggs') || '[]').filter(id => EGGS.some(e => e.id === id)); } catch (e) {}
+  const save = () => { try { localStorage.setItem('resham-eggs', JSON.stringify(found)); } catch (e) {} };
+  let lastPoint = [innerWidth / 2, innerHeight / 2];
+  addEventListener('pointerdown', e => { lastPoint = [e.clientX, e.clientY]; }, { passive: true, capture: true });
+  const render = () => {
+    const n = found.length, pill = $('#eggPill');
+    pill.hidden = n === 0;
+    $('#eggCount').textContent = n === 5 ? 'All 5 threads found' : `${n} of 5 hidden threads`;
+    $$('.spool i', pill).forEach((i, k) => i.classList.toggle('on', k < n));
+    $('#eggList').innerHTML = EGGS.map(e => {
+      const on = found.includes(e.id);
+      return `<li class="${on ? 'found' : ''}">${on ? ICON_ON : ICON_OFF}<div><b>${on ? e.name : 'Not found yet'}</b><span>${on ? 'Found.' : e.hint}</span></div></li>`;
+    }).join('');
+    $('#eggMirror')?.classList.toggle('found', found.includes('mirror'));
+  };
+  return {
+    count: () => found.length,
+    has: id => found.includes(id),
+    find(id) {
+      if (found.includes(id)) return;
+      found.push(id); save(); render();
+      const egg = EGGS.find(e => e.id === id);
+      threadBurst(...lastPoint);
+      if (found.length === 5) { discounts.eggs = 15; saveDiscounts(); renderBag(); setTimeout(showReward, 700); }
+      else toast(`You found a hidden thread: ${egg.name}. ${found.length} of 5.`);
+    },
+    init() {
+      render();
+      if (found.length === 5 && !discounts.eggs) { discounts.eggs = 15; saveDiscounts(); }
+      const pill = $('#eggPill'), sheet = $('#eggSheet');
+      pill.addEventListener('click', () => { const open = sheet.hidden; sheet.hidden = !open; pill.setAttribute('aria-expanded', String(open)); });
+      document.addEventListener('click', e => { if (!sheet.hidden && !e.target.closest('#eggSheet,#eggPill')) { sheet.hidden = true; pill.setAttribute('aria-expanded', 'false'); } });
+      // 1. the needle: three quick taps
+      let taps = [];
+      $('#needle').addEventListener('click', e => {
+        e.preventDefault(); e.stopPropagation();
+        const now = performance.now(); taps = taps.filter(t => now - t < 2000); taps.push(now);
+        const m = $('#needle'); m.classList.add('spin'); setTimeout(() => m.classList.remove('spin'), 300);
+        if (taps.length >= 3) { eggs.find('needle'); taps = []; }
+      });
+      // 4. the lost mirror
+      $('#eggMirror').addEventListener('click', () => eggs.find('mirror'));
+      // 5. the signature: five taps on the footer word
+      let ftaps = [];
+      $('#footWord').addEventListener('click', () => {
+        const now = performance.now(); ftaps = ftaps.filter(t => now - t < 2500); ftaps.push(now);
+        gsap.fromTo('#footWord', { scale: 1 }, { scale: 1.015, duration: .12, yoyo: true, repeat: 1 });
+        if (ftaps.length >= 5) { eggs.find('signature'); ftaps = []; }
+      });
+      $('#rewardClose').addEventListener('click', () => { $('#reward').classList.remove('is-on'); lenis?.start(); });
+    }
+  };
+})();
+
+/* golden threads burst out of the spot you found */
+function threadBurst(x, y) {
+  if (reduceMotion) return;
+  const NS = 'http://www.w3.org/2000/svg', svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('class', 'thread-burst'); svg.setAttribute('viewBox', `0 0 ${innerWidth} ${innerHeight}`);
+  const cols = ['#F3B23A', '#D01A66', '#ffffff', '#E9C066'];
+  for (let i = 0; i < 16; i++) {
+    const a = i / 16 * Math.PI * 2 + Math.random() * .3, r = 90 + Math.random() * 120;
+    const ex = x + Math.cos(a) * r, ey = y + Math.sin(a) * r;
+    const cx = x + Math.cos(a + .9) * r * .5, cy = y + Math.sin(a + .9) * r * .5;
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', `M${x} ${y} Q${cx} ${cy} ${ex} ${ey}`);
+    path.setAttribute('fill', 'none'); path.setAttribute('stroke', cols[i % 4]); path.setAttribute('stroke-width', 2); path.setAttribute('stroke-linecap', 'round');
+    svg.appendChild(path);
+    const len = path.getTotalLength();
+    path.style.strokeDasharray = `${len * .4} ${len}`; path.style.strokeDashoffset = len * .4;
+    gsap.to(path, { strokeDashoffset: -len, duration: .9 + Math.random() * .4, ease: 'power2.out', delay: Math.random() * .1 });
+  }
+  for (let i = 0; i < 10; i++) {
+    const c = document.createElementNS(NS, 'circle');
+    c.setAttribute('cx', x); c.setAttribute('cy', y); c.setAttribute('r', 3 + Math.random() * 3); c.setAttribute('fill', i % 2 ? '#E8EEF2' : '#F3B23A');
+    svg.appendChild(c);
+    const a = Math.random() * Math.PI * 2, r = 60 + Math.random() * 140;
+    gsap.to(c, { attr: { cx: x + Math.cos(a) * r, cy: y + Math.sin(a) * r + 40 }, opacity: 0, duration: 1.2, ease: 'power2.out' });
+  }
+  document.body.appendChild(svg);
+  setTimeout(() => svg.remove(), 1600);
+}
+
+/* the reward: threads weave a little swatch */
+function showReward() {
+  const svg = $('#weaveSvg'), N = 9, step = 150 / (N + 1);
+  const warpCol = i => (i % 2 ? '#D01A66' : '#F3B23A'), weftCol = j => (j % 2 ? '#F9EAF0' : '#E9C066');
+  let html = '';
+  for (let i = 1; i <= N; i++) html += `<line class="warp" x1="${i * step}" y1="10" x2="${i * step}" y2="140" stroke="${warpCol(i)}" stroke-width="7" stroke-linecap="round"/>`;
+  for (let j = 1; j <= N; j++) html += `<line class="weft" x1="10" y1="${j * step}" x2="140" y2="${j * step}" stroke="${weftCol(j)}" stroke-width="7" stroke-linecap="round"/>`;
+  // over-under: where the warp passes over, redraw a short piece of it on top of the weft
+  for (let j = 1; j <= N; j++) for (let i = 1; i <= N; i++) if ((i + j) % 2 === 0)
+    html += `<line class="over" data-row="${j}" x1="${i * step}" y1="${j * step - 6}" x2="${i * step}" y2="${j * step + 6}" stroke="${warpCol(i)}" stroke-width="7"/>`;
+  svg.innerHTML = html;
+  $('#reward').classList.add('is-on'); lenis?.stop();
+  if (!reduceMotion) {
+    gsap.fromTo($$('.warp', svg), { attr: { y2: 10 } }, { attr: { y2: 140 }, duration: .6, stagger: .05, ease: 'power2.out' });
+    gsap.fromTo($$('.weft', svg), { attr: { x2: 10 } }, { attr: { x2: 140 }, duration: .45, stagger: .09, delay: .55, ease: 'power1.inOut' });
+    $$('.over', svg).forEach(o => gsap.fromTo(o, { opacity: 0 }, { opacity: 1, duration: .15, delay: .55 + (+o.dataset.row - 1) * .09 + .3 }));
+  }
+  threadBurst(innerWidth / 2, innerHeight / 2 - 80);
+}
+
+/* =========================================================
+   Noor, the voice concierge (ElevenLabs Agents)
+   ========================================================= */
+const NOOR_AGENT_ID = 'agent_7001m7aymmpaejgvxjavbj8e48dm';   // public agent; discounts are capped again below
+const SDK_URL = 'https://cdn.jsdelivr.net/npm/@elevenlabs/client@1.36.0/dist/lib.iife.js';
+function initVoice() {
+  const fab = $('#voiceFab'), panel = $('#voicePanel'), log = $('#voiceLog'), status = $('#voiceStatus');
+  const callBtn = $('#voiceCall'), muteBtn = $('#voiceMute'), orb = $('#voiceOrb');
+  let conv = null, busy = false, muted = false, raf = 0;
+  const line = (who, text) => { const li = document.createElement('li'); li.className = who; li.textContent = text; log.appendChild(li); log.scrollTop = log.scrollHeight; };
+  const setStatus = t => { status.textContent = t; };
+  const openPanel = () => { panel.hidden = false; fab.classList.add('is-hidden'); if (!log.children.length) line('ai', "Hi, I'm Noor. Press Start talking and ask me anything, including whether there's a discount for you today."); };
+  const closePanel = async () => { panel.hidden = true; fab.classList.remove('is-hidden'); if (conv) { try { await conv.endSession(); } catch (e) {} } };
+  const loadSDK = () => window.ElevenLabsClient ? Promise.resolve() : new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = SDK_URL; s.onload = res; s.onerror = () => rej(new Error('sdk')); document.head.appendChild(s);
+  });
+  const sections = { collections: '#collections', craft: '#craft', shop_the_look: '#look', new_in: '#shop', makers: '#studio', outfit_finder: '#finder', journal: '#journal' };
+  const clientTools = {
+    apply_discount: ({ percent, reason }) => {
+      const pct = Math.round(Number(percent));
+      if (!(pct >= 5 && pct <= 10)) return 'Refused: the website only accepts a voice discount from 5 to 10 percent.';
+      if (discounts.voice) return `Not applied: the shopper already has ${discounts.voice} percent from you (code NOOR${discounts.voice}). Only one voice discount per shopper.`;
+      discounts.voice = pct; discounts.voiceReason = String(reason || '').slice(0, 80); saveDiscounts(); renderBag();
+      line('sys', `${pct}% added to your bag (code NOOR${pct})`); toast(`Noor added ${pct}% off to your bag`);
+      const best = bestDiscount();
+      return `Applied ${pct} percent, code NOOR${pct}.${best.code === 'RESHAM15' ? ' Note: they already unlocked 15 percent from the hidden threads, and the bigger discount is the one used.' : ''}`;
+    },
+    show_on_site: ({ section }) => {
+      if (section === 'bag') { window.__openBag(); return 'Opened the bag.'; }
+      const el = $(sections[section] || '#top');
+      if (lenis) lenis.scrollTo(el, { offset: -10, duration: 1.4 }); else el.scrollIntoView({ behavior: 'smooth' });
+      return `Showing ${section.replace(/_/g, ' ')}.`;
+    },
+    get_bag: () => {
+      const sub = bag.reduce((s, l) => s + allItems[l.id].price * l.qty, 0), d = bestDiscount();
+      return JSON.stringify({
+        items: bag.map(l => ({ name: allItems[l.id].name, size: l.size, qty: l.qty, price: allItems[l.id].price })),
+        subtotal_usd: sub, discount_applied: d.percent ? `${d.percent}% (${d.code})` : 'none',
+        voice_discount_already_given: !!discounts.voice, hidden_threads_found: eggs.count(), hidden_threads_total: 5
+      });
+    }
+  };
+  const end = () => {
+    conv = null; cancelAnimationFrame(raf); orb.style.removeProperty('--lvl'); delete panel.dataset.mode;
+    callBtn.textContent = 'Start talking'; muteBtn.disabled = true; setStatus('Call ended');
+  };
+  async function start() {
+    if (conv || busy) return;
+    busy = true; callBtn.textContent = 'Connecting…';
+    try {
+      setStatus('Waiting for your microphone…');
+      try { const st = await navigator.mediaDevices.getUserMedia({ audio: true }); st.getTracks().forEach(t => t.stop()); }
+      catch (e) { e.msg = 'Noor needs your microphone. Allow microphone access for this site and try again. (Previews inside other apps may block it; the live site works.)'; throw e; }
+      setStatus('Connecting…');
+      await loadSDK();
+      conv = await window.ElevenLabsClient.Conversation.startSession({
+        agentId: NOOR_AGENT_ID,
+        clientTools,
+        onConnect: () => { setStatus('Listening'); muteBtn.disabled = false; callBtn.textContent = 'End call'; },
+        onDisconnect: () => { end(); line('sys', 'Call ended'); },
+        onMessage: m => { if (m && m.message) line((m.role || m.source) === 'user' ? 'user' : 'ai', m.message); },
+        onModeChange: ({ mode }) => { panel.dataset.mode = mode; if (!muted) setStatus(mode === 'speaking' ? 'Noor is speaking' : 'Listening'); },
+        onError: msg => { line('sys', 'Connection problem. Please try again.'); console.warn('Noor:', msg); }
+      });
+      const tick = () => {
+        if (!conv) return; let v = 0;
+        try { v = panel.dataset.mode === 'speaking' ? conv.getOutputVolume() : conv.getInputVolume(); } catch (e) {}
+        orb.style.setProperty('--lvl', (1 + Math.min(.3, v * .9)).toFixed(3));
+        raf = requestAnimationFrame(tick);
+      };
+      tick();
+    } catch (e) {
+      conv = null; setStatus('Not connected'); callBtn.textContent = 'Try again';
+      line('sys', e.msg || "Noor couldn't connect. Please try again in a moment.");
+      console.warn('Noor:', e);
+    } finally { busy = false; }
+  }
+  fab.addEventListener('click', openPanel);
+  $('#voiceClose').addEventListener('click', closePanel);
+  callBtn.addEventListener('click', async () => { if (conv) { try { await conv.endSession(); } catch (e) {} end(); } else start(); });
+  muteBtn.addEventListener('click', () => {
+    if (!conv) return; muted = !muted;
+    try { conv.setMicMuted(muted); } catch (e) {}
+    muteBtn.textContent = muted ? 'Unmute' : 'Mute'; setStatus(muted ? 'Muted' : 'Listening');
+  });
 }
 
 /* =========================================================
@@ -816,6 +1138,9 @@ function boot() {
   initFinder();
   initForms();
   initMenu();
+  eggs.init();
+  initVoice();
+  renderBag();
   if (webglOK) requestAnimationFrame(frame);
   const go = () => { intro(); ScrollTrigger.refresh(); };
   (document.fonts?.ready || Promise.resolve()).then(go);

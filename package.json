@@ -1,15 +1,16 @@
 {
   "name": "resham",
   "version": "1.0.0",
-  "description": "",
+  "description": "Resham: hand-embroidered womenswear concept site (Three.js, GSAP, ElevenLabs)",
   "main": "index.js",
   "scripts": {
     "build": "sh build.sh"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Usman Nadeem",
+  "license": "SEE LICENSE IN LICENSE.md",
   "dependencies": {
+    "@elevenlabs/client": "^1.36.0",
     "esbuild": "^0.24.0",
     "gsap": "^3.12.5",
     "lenis": "^1.1.13",
