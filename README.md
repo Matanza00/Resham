@@ -1,6 +1,6 @@
 # Resham: hand-embroidered womenswear
 
-**Live site:** https://resham.vercel.app
+**Live site:** https://resham-ruby.vercel.app
 
 Made by Usman Nadeem · https://github.com/Matanza00
 
